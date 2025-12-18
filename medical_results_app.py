@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, Tuple, Optional, Callable, Any
+from typing import Dict, Tuple, Optional, Callable, Any, List
 
 import pandas as pd
 import pdfplumber
@@ -125,6 +125,81 @@ def parse_lab_results_folder(
 	df = pd.DataFrame.from_dict(merged_data, orient="index")
 
 	# Remove rows where all values are non-numeric (likely text/header rows)
+	numeric_df = df.apply(pd.to_numeric, errors="coerce")
+	mask_keep = numeric_df.notna().any(axis=1)
+	df = df[mask_keep]
+
+	try:
+		df = df.reindex(
+			sorted(df.columns, key=lambda x: pd.to_datetime(x, format="%d.%m.%Y")),
+			axis=1,
+		)
+	except Exception:
+		df = df.reindex(sorted(df.columns), axis=1)
+
+	df.index.name = "Test"
+
+	return df, test_metadata
+
+
+def parse_lab_results_uploaded(
+	files: List[Any],
+	progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
+	"""Parse uploaded PDF lab results into a single table.
+
+	`files` is a list of file-like objects (e.g. Streamlit UploadedFile).
+	Returns (df, test_metadata) in the same format as parse_lab_results_folder.
+	"""
+
+	if not files:
+		return pd.DataFrame(), {}
+
+	merged_data: Dict[str, Dict[str, str]] = {}
+	test_metadata: Dict[str, Dict[str, Any]] = {}
+	total_files = len(files)
+
+	for idx, file_obj in enumerate(files):
+		filename = getattr(file_obj, "name", f"file_{idx + 1}.pdf")
+		if hasattr(file_obj, "seek"):
+			file_obj.seek(0)
+
+		if progress_callback is not None:
+			progress_callback(idx, total_files, filename)
+
+		# Reuse existing extractor; pdfplumber.open accepts file-like objects
+		date, results_df = extract_pdf_results(file_obj)
+
+		if not date or results_df.empty:
+			continue
+
+		for _, row in results_df.iterrows():
+			test_name = str(row.get("Test", "")).strip()
+			test_value = str(row.get("Result", "")).strip()
+			unit = str(row.get("Unit", "")).strip()
+			ref_range = str(row.get("Reference Range", "")).strip()
+
+			if not test_name:
+				continue
+
+			if test_name not in merged_data:
+				merged_data[test_name] = {}
+
+			merged_data[test_name][date] = test_value
+
+			if test_name not in test_metadata:
+				test_metadata[test_name] = {"unit": "", "ref_raw": ""}
+			info = test_metadata[test_name]
+			if unit and not info.get("unit"):
+				info["unit"] = unit
+			if ref_range and not info.get("ref_raw"):
+				info["ref_raw"] = ref_range
+
+	if not merged_data:
+		return pd.DataFrame(), {}
+
+	df = pd.DataFrame.from_dict(merged_data, orient="index")
+
 	numeric_df = df.apply(pd.to_numeric, errors="coerce")
 	mask_keep = numeric_df.notna().any(axis=1)
 	df = df[mask_keep]
@@ -370,13 +445,61 @@ def main() -> None:
 
 	with st.sidebar:
 		st.header("Settings")
-		default_folder = os.getcwd()
-		folder_path = st.text_input(
-			"Folder with PDF files",
-			value=default_folder,
-			help="Enter a folder path on this computer that contains your .pdf lab results.",
+		base_dir = os.getcwd()
+		data_source = st.radio(
+			"Data source",
+			("Folder on disk", "Upload PDFs"),
+			key="data_source",
 		)
-		parse_button = st.button("Parse PDFs")
+		folder_path = ""
+		uploaded_files: Optional[List[Any]] = None
+
+		if data_source == "Folder on disk":
+			folder_mode = st.radio(
+				"How to choose folder?",
+				("Browse project folders", "Enter custom path"),
+				key="folder_mode",
+			)
+			if folder_mode == "Browse project folders":
+				subdirs = []
+				for root, dirs, files in os.walk(base_dir):
+					rel_root = os.path.relpath(root, base_dir)
+					if rel_root == ".":
+						continue
+					subdirs.append(rel_root)
+				subdirs = sorted(set(subdirs))
+				if subdirs:
+					selected_rel = st.selectbox(
+						"Folder with PDF files",
+						options=subdirs,
+						key="folder_select",
+						help="Choose a folder inside this project that contains your .pdf lab results.",
+					)
+					folder_path = os.path.join(base_dir, selected_rel)
+				else:
+					st.info("No subfolders found in this project; please enter a custom path instead.")
+					folder_path = st.text_input(
+						"Folder with PDF files",
+						value=base_dir,
+						key="folder_input",
+						help="Enter a folder path that contains your .pdf lab results.",
+					)
+			else:
+				folder_path = st.text_input(
+					"Folder with PDF files",
+					value=base_dir,
+					key="folder_input",
+					help="Enter a folder path that contains your .pdf lab results.",
+				)
+		else:
+			uploaded_files = st.file_uploader(
+				"Upload PDF lab reports",
+				accept_multiple_files=True,
+				type=["pdf"],
+				key="pdf_uploader",
+			)
+
+		parse_button = st.button("Parse PDFs", key="parse_button")
 
 	if "parsed_df" not in st.session_state:
 		st.session_state["parsed_df"] = None
@@ -386,29 +509,39 @@ def main() -> None:
 		st.session_state["test_metadata"] = {}
 
 	if parse_button:
-		if not folder_path or not os.path.isdir(folder_path):
-			st.error("Please provide a valid existing folder path.")
-		else:
-			with st.spinner("Parsing PDFs..."):
-				progress_bar = st.progress(0)
-				status_text = st.empty()
+		with st.spinner("Parsing PDFs..."):
+			progress_bar = st.progress(0)
+			status_text = st.empty()
 
-				def progress_cb(current: int, total: int, filename: str) -> None:
-					if total > 0:
-						percent = int(((current + 1) / total) * 100)
-						progress_bar.progress(percent)
-					status_text.text(f"Processing {current + 1}/{total} – {filename}")
+			def progress_cb(current: int, total: int, filename: str) -> None:
+				if total > 0:
+					percent = int(((current + 1) / total) * 100)
+					progress_bar.progress(percent)
+				status_text.text(f"Processing {current + 1}/{total} – {filename}")
 
-				try:
+			try:
+				if data_source == "Folder on disk":
+					if not folder_path or not os.path.isdir(folder_path):
+						st.error("Please provide a valid existing folder path.")
+						return
 					parsed_df, test_metadata = parse_lab_results_folder(
 						folder_path, progress_callback=progress_cb
 					)
-					st.session_state["parsed_df"] = parsed_df
 					st.session_state["parsed_folder"] = folder_path
-					st.session_state["test_metadata"] = test_metadata
-				except Exception as e:
-					st.session_state["parsed_df"] = None
-					st.error(f"Error while parsing PDFs: {e}")
+				else:
+					if not uploaded_files:
+						st.error("Please upload at least one PDF file.")
+						return
+					parsed_df, test_metadata = parse_lab_results_uploaded(
+						uploaded_files, progress_callback=progress_cb
+					)
+					st.session_state["parsed_folder"] = None
+
+				st.session_state["parsed_df"] = parsed_df
+				st.session_state["test_metadata"] = test_metadata
+			except Exception as e:
+				st.session_state["parsed_df"] = None
+				st.error(f"Error while parsing PDFs: {e}")
 
 	parsed_df: Optional[pd.DataFrame] = st.session_state.get("parsed_df")
 	parsed_folder: Optional[str] = st.session_state.get("parsed_folder")
